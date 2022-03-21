@@ -1,2 +1,4 @@
-# Analisi statistica e di Enrichment su varie omiche per il monitoraggio degli effetti della Streptozocina su campioni di ratti
-
+<h3 align="center">
+<img src="https://raw.githubusercontent.com/roberto722/Enrichement-and-Statistical-Analysis-on-R/main/SlideShow/Diapositiva1.PNG" />
+<img src="https://raw.githubusercontent.com/roberto722/Enrichement-and-Statistical-Analysis-on-R/main/SlideShow/Diapositiva2.PNG" />
+</h3>
