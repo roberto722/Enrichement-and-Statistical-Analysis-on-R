@@ -1,0 +1,753 @@
+---
+title: "Report_omiche"
+author: "Roberto Scardigno"
+date: "6/10/2021"
+output: html_document
+---
+# Analisi statistica e di Enrichment su varie omiche per il monitoraggio degli effetti della Streptozocina e dell'insulina su vari campioni di ratti.
+Le omiche considerate sono: metabolomica, RNA e miRNA.
+L'analisi è stata effettuata su: 
+  * un gruppo a cui è stata somministrata Streptozocina;
+  * un gruppo a cui è stata somministrata Inuslina;
+  * un gruppo di controllo (a cui non è stato somministrato niente).
+I distretti anatomici considerati sono stati: 
+  * Cervelletto;
+  * Corteccia;
+  * Ipotalamo;
+  * Ippocampo.
+In alcune omiche erano presenti altri tessuti come cuore, reni, ecc... che sono stati esclusi dall'analisi complessiva.
+
+Il workflow, per tutte le omiche, è pressochè identico, seppur effettuato con metodiche diverse, in quanto dati provenienti da ambienti diversi vanno trattati differentemente.
+In dettaglio è stato effettuato:
+  1. Lettura del dataset da file e divisione per distretto anatomico;
+  2. Pre-processing del dataset per eliminare eventuali campioni o feature non utilizzabili;
+  3. Trasformazione logaritmica e normalizzazione;
+  4. Analisi statistica con LIMMA;
+  5. PCA esplorativa;
+  6. Enrichment dei dati.
+
+N.B. Alcune omiche hanno richiesto degli step intermedi per un'analisi completa che verranno commentate in seguito 
+
+
+Librerie per analisi con LIMMA
+```{r, message = FALSE, warning = FALSE}
+library("readr")
+library("BiocManager")
+library("biomaRt")
+library("RSQLite")
+library("rlist")
+library("stats")
+library("limma")
+library("edgeR")
+library("mixOmics")
+library("ggplot2")
+library("gridExtra")
+```
+Librerie per Enrichment dei dati
+```{r, message = FALSE, warning = FALSE}
+library(topGO)
+library(tidyverse)
+library(dplyr)
+library(Rgraphviz)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(FELLA)
+library(rbioapi)
+library(ComplexHeatmap)
+library(circlize)
+library(org.Rn.eg.db)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Omica 1: RNA
+Questa omica prende in considerazione i dati ottenuti dal sequenziamento tramite NGS, in grado di rivelare la presenza e la quantità di RNA di un determinato campione biologico in un determinato momento. Il NGS è stato effettuato tramite una macchina Agilent.
+
+### Caricamento Dataset
+
+```{r, message = FALSE}
+dataset = read_tsv("mRNA/GENE EXPRESSION RAT GNONI.txt")
+
+```
+
+### Pre-processing dei dati
+
+I dati genetici vengono recuperati da Ensembl.org tramite BioMart
+
+```{r, message = FALSE}
+ensembl = useMart(biomart="ensembl", dataset="rnorvegicus_gene_ensembl")
+dictionary = getBM(attributes = c('ensembl_gene_id', 'external_gene_name', 'description', 'agilent_wholegenome_4x44k_v3'), mart = ensembl)
+full_dataset <- merge(dataset, dictionary, by.x = "ProbeName", by.y = "agilent_wholegenome_4x44k_v3")
+```
+
+Eliminazione dei geni non annotati
+```{r}
+full_dataset <- full_dataset[!(is.na(full_dataset$external_gene_name) | full_dataset$external_gene_name==""), ]
+```
+
+Eliminazione dei long non-coding RNA
+```{r}
+full_dataset <- full_dataset[grep("LOC", full_dataset$external_gene_name, invert = TRUE), ] 
+```
+
+Dopo questa fase sono ancora presenti Probes che molto probabilmente sono non-coding RNA ma non sono ancora ben identificati
+
+Viene effettuata una media dei dati delle Probes associate ad uno stesso gene
+```{r}
+dataset_filtered <- aggregate(full_dataset[, 2:(length(full_dataset)-3)], by = list(full_dataset$ensembl_gene_id), FUN  = "mean")
+colnames(dataset_filtered)[1] = "Ensembl Gene"
+```
+
+Divisione del dataset nei vari casi STZ (ratti con Streptozocina), INS (ratti con insulina) e CTRL (gruppo di controllo)
+```{r}
+dataset_ctrl_cervelletto <- dataset_filtered[ ,c(2,6,10)]
+dataset_ctrl_corteccia   <- dataset_filtered[ ,c(3,7,11)]
+dataset_ctrl_ipotalamo   <- dataset_filtered[ ,c(4,8,12)]
+dataset_ctrl_ippocampo   <- dataset_filtered[ ,c(5,9,13)]
+
+dataset_ins_cervelletto  <- dataset_filtered[ ,c(14,18,22)]
+dataset_ins_corteccia    <- dataset_filtered[ ,c(15,19,23)]
+dataset_ins_ipotalamo    <- dataset_filtered[ ,c(16,20,24)]
+dataset_ins_ippocampo    <- dataset_filtered[ ,c(17,21,25)]
+
+dataset_stz_cervelletto  <- dataset_filtered[ ,c(26,30,34,38,42,46)]
+dataset_stz_corteccia    <- dataset_filtered[ ,c(27,31,35,39,43,47)]
+dataset_stz_ipotalamo    <- dataset_filtered[ ,c(28,32,36,40,44,48)]
+dataset_stz_ippocampo    <- dataset_filtered[ ,c(29,33,37,41,45,49)]
+```
+
+### Analisi con LIMMA e PCA esplorativa
+L'analisi con LIMMA permette di identificare la probabilità che la differenza di espressione genica tra gruppo 1 e gruppo 2 sia statisticamente significativa, restituendo un p-Value che successivamente verrà corretto data la mole di confronti fatti.
+Infine, la PCA consentirà di visualizzare, la distribuzione dei campioni considerati in uno spazio bidimensionale. 
+```{r}
+contrasts_to_do <- list(c("dataset_ctrl_cervelletto", "dataset_ins_cervelletto"),c("dataset_ctrl_cervelletto", "dataset_stz_cervelletto"),c("dataset_ins_cervelletto", "dataset_stz_cervelletto"),
+                        c("dataset_ctrl_corteccia", "dataset_ins_corteccia"),c("dataset_ctrl_corteccia", "dataset_stz_corteccia"),c("dataset_ins_corteccia", "dataset_stz_corteccia"),
+                        c("dataset_ctrl_ipotalamo", "dataset_ins_ipotalamo"),c("dataset_ctrl_ipotalamo", "dataset_stz_ipotalamo"),c("dataset_ins_ipotalamo", "dataset_stz_ipotalamo"),
+                        c("dataset_ctrl_ippocampo", "dataset_ins_ippocampo"),c("dataset_ctrl_ippocampo", "dataset_stz_ippocampo"),c("dataset_ins_ippocampo", "dataset_stz_ippocampo"))
+```
+
+Per ogni iterazione viene effettuato un test delle ipotesi che produce un p-Value e un p-Value corretto tramite False Discovery Rate, in particolare tramite il metodo di Benjamini-Hochberg
+```{r, eval = FALSE}
+for (i in 1:length(contrasts_to_do)){
+  dataset_to_fit <- cbind(eval(as.name(contrasts_to_do[[i]][1])), eval(as.name(contrasts_to_do[[i]][2]))) 
+  rownames(dataset_to_fit) <- dataset_filtered$'Ensemble Gene'
+  group <- as.factor(c(rep(1, length(eval(as.name(contrasts_to_do[[i]][1])))), rep(2, length(eval(as.name(contrasts_to_do[[i]][2]))))))
+  design <- model.matrix(~0 + group)
+  contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+  fit <- lmFit(dataset_to_fit, design)
+  fit2 <- contrasts.fit(fit, contrasts.matrix)
+  fit2 <- eBayes(fit2)
+  results <- decideTests(fit2)
+
+  # Salvataggio dei report
+  jpeg(paste("volcanoplot", i, ".jpeg", sep = "_"), width = 700, height = 500)
+  volcanoplot(fit2)
+  dev.off()
+  
+  write.fit(fit2, file = paste("Report", i, contrasts_to_do[[i]][2], "VS", contrasts_to_do[[i]][1], ".txt", sep = "_"), sep = ",", adjust = "BH", results = results)
+  
+  # PCA Esplorativa
+  pca_dataset <- t(dataset_to_fit)
+  colnames(pca_dataset) <- rownames(dataset_to_fit)
+  pca_results <- pca(pca_dataset, ncomp = 6)
+  jpeg(paste("mRNA_pcaIndiv", contrasts_to_do[[i]][1], contrasts_to_do[[i]][2], ".jpeg", sep = "_"), width = 700, height = 500)
+  plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+  dev.off()
+}
+```
+
+### Esempio: Confronto dei dati tra STZ e CTRL nella corteccia
+```{r}
+for (i in 5){
+  dataset_to_fit <- cbind(eval(as.name(contrasts_to_do[[i]][1])), eval(as.name(contrasts_to_do[[i]][2]))) 
+  rownames(dataset_to_fit) <- dataset_filtered$'Ensembl Gene'
+  group <- as.factor(c(rep(1, length(eval(as.name(contrasts_to_do[[i]][1])))), rep(2, length(eval(as.name(contrasts_to_do[[i]][2]))))))
+  design <- model.matrix(~0 + group)
+  contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+  fit <- lmFit(dataset_to_fit, design)
+  fit2 <- contrasts.fit(fit, contrasts.matrix)
+  fit2 <- eBayes(fit2)
+  limma_table = topTable(fit2, number = 150)
+  hist(limma_table$P.Value, col=10, main = "Histogram of p-Value - STZ vs CTRL", xlab= "p-Value")
+  hist(limma_table$adj.P.Val, col=10, main = "Histogram of adjusted p-Value - STZ vs CTRL", xlab= "adj. p-Value")
+  
+  volcanoplot(fit2)
+  
+   # PCA Esplorativa
+  pca_dataset <- t(dataset_to_fit)
+  colnames(pca_dataset) <- rownames(dataset_to_fit)
+  pca_results <- pca(pca_dataset, ncomp = 6)
+  pca_results
+  plot(pca_results)
+}
+```
+
+### Enrichment dei dati tramite GO
+Analisi effettuata sull'esempio precedente: STZ vs CTRL nella corteccia
+
+Recupero tramite BioMart delle funzioni associate ai singoli geni oggetti dello studio e caricamento del dataset
+In prima istanza viene scaricato il dizionario completo dei geni individuati nel Rattus Norvegicus, soggetto dello studio; dopodichè viene caricato un report contenente i geni e i rispettivi p-value per essere valutati.
+Grazie all'enrichment è possibile individuare, tramite varie tecniche (grafo, bar plot, ecc...), il significato di ogni gene e gli effetti che una sua sovraespressione/sottespressione può produrre.
+In questo primo enrichment dei dati viene utilizzata la Gene Ontology che, tramite un grafo, consente di ricostruire le varie connessioni che sono presenti tra i vari geni, sottoforma di processi biologici. Per semplificazione in questa prima parte non vengono considerate le altre 2 tipologie: funzioni molecolari e componenti cellulari.
+```{r}
+GOdictionary_full = getBM(attributes = c('ensembl_gene_id', 'go_id', 'name_1006','definition_1006', 'entrezgene_id'), mart = ensembl)
+dataset = read.csv2("Report_5_dataset_stz_corteccia_VS_dataset_ctrl_corteccia_.csv", row.names = 1)
+```
+
+Rimozione dei geni non associati e preparazione del dataset.
+Vengono considerati solo i geni che hanno un p-Value minore a 0.05
+```{r}
+GOdictionary_full <- GOdictionary_full[GOdictionary_full$go_id != '',]
+GOdictionary <- GOdictionary_full %>% dplyr::select('ensembl_gene_id', 'go_id')
+
+geneID2GO <- by(GOdictionary$go_id, GOdictionary$ensembl_gene_id, function(x) as.character(x))
+
+geneNames <- names(geneID2GO)
+data_to_enrich <- subset(dataset, P.Value < '0.05')
+geneList <- factor(as.integer(geneNames %in% row.names(data_to_enrich)))
+names(geneList) <- geneNames
+RAT.GO.Obj <- new("topGOdata", ontology='BP', allGenes = geneList, annot = annFUN.gene2GO, gene2GO = geneID2GO)
+```
+Il test di Fisher permette di individuare quali geni, tra quelli già selezionati, sono, nei processi biologici, statisticamente significativi.
+
+Test esatto di Fisher (GO Enrichment)
+```{r}
+resultFisher <- runTest(RAT.GO.Obj, algorithm = "classic", statistic = "fisher")
+resultFisher
+
+pvalFis <- score(resultFisher)
+hist(pvalFis, 50, xlab = "p-values")
+geneData(resultFisher)
+```
+
+Visualizzazione dei risultati tramite grafo aciclico
+```{r fig.height=10, fig.width=10}
+allRes <- GenTable(RAT.GO.Obj, classic = resultFisher,orderBy = "weight", ranksOf = "classic", topNodes = 20)
+goID <- allRes[10, "GO.ID"]
+showSigOfNodes(RAT.GO.Obj, score(resultFisher), firstSigNodes = 15, useInfo = 'all')
+printGraph(RAT.GO.Obj, resultFisher, firstSigNodes = 23, fn.prefix = "tGO", useInfo = "all", pdfSW = TRUE)
+```
+
+### Analisi dei geni sovra/sotto-espressi tramite GSEA (Gene Set Enrichment Analysis) nella Gene Ontology
+In questa parte di analisi, non vengono più considerati i p-Value estratti con LIMMA, ma la sovra/sotto-espressione di ogni gene. In questo caso si identificano i geni sovra-espressi come coloro che hanno un log Fold-Change maggiore a 1.5, mentre i geni sotto-espressi come coloro che hanno un log Fold-Change minore a -1.5.
+
+Visualizzazione di un Bar Plot e un Dot Plot che mostrano quali processi biologici e funzioni molecolari svolgono i geni sovra-espressi e sotto-espressi nella Gene Ontology. Per ultimo troviamo le componenti cellulari coinvolte nell'analisi.
+Grazie a questa analisi è possibile individuare con quale livello di significatività ogni processo, funzione o componente risulta differentemente espresso.
+```{r paged.print=TRUE}
+# L'analisi GSEA richiede di lavorare sugli EntrezID (banca dati del NCBI) e non con gli Ensemble
+EntrezIDs <- unique(GOdictionary_full %>% dplyr::select('ensembl_gene_id', 'entrezgene_id'))
+EntrezIDs <- EntrezIDs %>% filter(entrezgene_id != "")
+dataset <- rownames_to_column(dataset, var = "EnsemblID")
+dataset_joined <- right_join(dataset, EntrezIDs, by = c("EnsemblID" = "ensembl_gene_id"), copy = FALSE, suffix = c(".x", ".y"))
+geneListGO <- data.frame(EntrezID = dataset_joined[ , "entrezgene_id"] , LogFC = dataset_joined[ , "logFC"]) 
+geneListGO_selected <- geneListGO %>% filter(LogFC > 1.5 | LogFC < -1.5)
+genes_entrezIDs <- as.character(geneListGO_selected[ , 1])
+
+# Over-representation Test su Processi Biologici
+ego <- enrichGO(gene          = genes_entrezIDs,
+                #universe      = as.character(geneListGO[, "EntrezID"]),
+                OrgDb         = org.Rn.eg.db,
+                keyType = "ENTREZID",
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff  = 0.1,
+                readable      = FALSE)
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego@result[1,"p.adjust"] < 0.1){
+  barplot(ego, showCategory=15) + ggtitle("Barplot with GO") 
+} 
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego@result[1,"p.adjust"] < 0.1){
+  dotplot(ego, showCategory=30) + ggtitle("Dotplot with GO") 
+} else {
+  print("L'analisi di Enrichment per processi biologici non può essere effettuata")
+}
+```
+```{r paged.print=TRUE}
+# Over-representation Test su Funzioni Molecolari
+ego2 <- enrichGO(gene          = genes_entrezIDs,
+                #universe      = as.character(geneListGO[, "EntrezID"]),
+                OrgDb         = org.Rn.eg.db,
+                keyType = "ENTREZID",
+                ont           = "MF",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff  = 0.1,
+                readable      = FALSE)
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego2@result[1,"p.adjust"] < 0.1){
+  barplot(ego2, showCategory=15) + ggtitle("Barplot with GO") 
+} 
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego2@result[1,"p.adjust"] < 0.1){
+  dotplot(ego2, showCategory=30) + ggtitle("Dotplot with GO") 
+} else {
+  print("L'analisi di Enrichment per funzioni molecolari non può essere effettuata")
+}
+```
+```{r paged.print=TRUE}
+# Over-representation Test su Componenti Cellulari
+ego3 <- enrichGO(gene          = genes_entrezIDs,
+                #universe      = as.character(geneListGO[, "EntrezID"]),
+                OrgDb         = org.Rn.eg.db,
+                keyType = "ENTREZID",
+                ont           = "CC",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff  = 0.1,
+                readable      = FALSE)
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego3@result[1,"p.adjust"] < 0.1){
+  barplot(ego3, showCategory=15) + ggtitle("Barplot with GO") 
+} 
+```
+```{r fig.width=10, paged.print=TRUE}
+if (ego3@result[1,"p.adjust"] < 0.1){
+  dotplot(ego3, showCategory=30) + ggtitle("Dotplot with GO") 
+} else {
+  print("L'analisi di Enrichment per componenti cellulari non può essere effettuata")
+}
+```
+
+## Omica 2: mi-RNA
+I microRNA sono piccole molecole endogene non codificanti. Sono lunghi circa 20-22 nucleotidi e sono principalmente attivi nella regolazione genica a livello trascrizionale e post-trascrizionale.
+
+Anche per questa omica viene fatta un'iniziale analisi per individuare la significatività della differenza di espressione genica tra i vari gruppi presi in esame ed, infine, viene effettuata un analisi di Enrichment.
+
+### Caricamento dataset
+```{r paged.print=TRUE}
+# Questi dati vengono considerati già log-trasformati
+raw_counts <- read.delim("miRNA/miRNA EXPRESSION RAT GNONI.txt", row.names = 1)
+```
+### Pre-processing
+```{r paged.print=TRUE}
+# Elimino le righe non coinvolte nell'analisi
+temp_raw_counts <- data.frame(t(raw_counts))
+raw_counts <- data.frame(t(temp_raw_counts %>% dplyr::select(contains("rno.miR"))))
+```
+
+```{r paged.print=TRUE}
+# Divisione del dataset per parte anatomica e normalizzazione tramite z-score
+dataset_cervelletto <- t(scale(raw_counts %>% dplyr::select(contains("CERVELLETTO"))))
+dataset_corteccia   <- t(scale(raw_counts %>% dplyr::select(contains("CORTECCIA"))))
+dataset_ipotalamo   <- t(scale(raw_counts %>% dplyr::select(contains("IPOTALAMO"))))
+dataset_ippocampo   <- t(scale(raw_counts %>% dplyr::select(contains("IPPOCAMPO"))))
+```
+```{r fig.width=10, paged.print=TRUE}
+# Visualizzazione di alcuni dati normalizzati tramite boxplot
+data_vis <- dataset_cervelletto
+bp1 <- ggplot(data.frame(data_vis[,1]), aes(x="rno-miR-1-3p", y=data_vis[,1])) + 
+  geom_boxplot()
+bp2 <- ggplot(data.frame(data_vis[,34]), aes(x="rno-miR-1249", y=data_vis[,34])) + 
+  geom_boxplot()
+bp3 <- ggplot(data.frame(data_vis[,45]), aes(x="rno-miR-128-1-5p", y=data_vis[,45])) + 
+  geom_boxplot()
+grid.arrange(bp1, bp2, bp3, nrow = 1, top = "Visualizzazione tramite boxplot di alcuni mi-RNA normalizzati")
+```
+
+### Analisi con LIMMA
+```{r paged.print=TRUE, eval = FALSE}
+ctrl_check <- "CTRL"
+stz_check  <- "STZ"
+ins_check  <- "INS"
+dataset_list <- c("dataset_cervelletto", "dataset_corteccia", "dataset_ipotalamo", "dataset_ippocampo")
+for (j in dataset_list)
+{
+  dataset_to_analyze <- as.data.frame(t(eval(parse(text = j))))
+  for (i in 1:3)
+  {
+    if (i == 1)
+    {
+      check_1 <- ctrl_check
+      check_2 <- ins_check
+    }
+    else if (i == 2)
+    {
+      check_1 <- stz_check
+      check_2 <- ctrl_check
+    }
+    else if (i == 3)
+    {
+      check_1 <- stz_check
+      check_2 <- ins_check
+    }
+    temp_dataset <- dataset_to_analyze %>% dplyr::select(contains(check_1) | contains(check_2))
+    len_1 <- length(dplyr::select(dataset_to_analyze, dplyr::contains(check_1))) # Verifico quanti casi sono presenti per il primo gruppo
+    len_2 <- length(dplyr::select(dataset_to_analyze, dplyr::contains(check_2))) # Verifico quanti casi sono presenti per il secondo gruppo
+    group <- as.factor(c(rep(1, len_1), rep(2, len_2)))
+    design <- model.matrix(~0 + group)
+    contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+    fit <- lmFit(temp_dataset, design)
+    fit2 <- contrasts.fit(fit, contrasts.matrix)
+    fit2 <- eBayes(fit2)
+    limma_table <- topTable(fit2)
+    head(temp_dataset) # Sommario delle prime features analizzate
+    limma_table # Risultati dell'analisi LIMMA
+    hist(limma_table$P.Value, col=10, main = paste("Histogram of p-Value -", check_1, "vs", check_2), xlab= "p-Value")
+    hist(limma_table$adj.P.Val, col=10, main = paste("Histogram of adjusted p-Value -", check_1, "vs", check_2), xlab= "adj. p-Value")
+    volcanoplot(fit2)
+    
+    # PCA esplorativa
+    pca_dataset <- t(temp_dataset)
+    colnames(pca_dataset) <- rownames(temp_dataset)
+    pca_results <- pca(pca_dataset, ncomp = 6)
+    pca_results
+    # Plot della distribuzione della varianza dopo PCA
+    plot(pca_results)
+    # Plot che mostra quali metaboliti pesano maggiormente sulla varianza della componente 1
+    plotLoadings(pca_results, title = 'Pesi sulla componente 1')
+    # Plot della distribuzione spaziale, tra le due componenti principali rilevate dalla PCA, dei casi presi in esame
+    plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+    
+    # Salvataggio dati
+    jpeg(paste("volcanoplot_", j, check_1, check_2, ".jpeg", sep = "_"), width = 700, height = 500)
+    volcanoplot(fit2)
+    dev.off()
+    
+    write.fit(fit2, file = paste("Report", j, check_1, "VS", check_2, ".txt", sep = "_"), sep = ";", adjust = "BH")
+    
+    jpeg(paste("pcaIndiv", j, check_1, check_2, ".jpeg", sep = "_"), width = 700, height = 500)
+    plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+    dev.off()
+  }
+}
+```
+
+### Esempio: Risultati tra STZ e CTRL nel cervelletto
+```{r paged.print=TRUE}
+example_dataset <- as.data.frame(t(dataset_cervelletto)) %>% dplyr::select(dplyr::contains("STZ") | dplyr::contains("CTRL"))
+len_1 <- length(dplyr::select(example_dataset, dplyr::contains("STZ"))) # Verifico quanti casi sono presenti per il primo gruppo
+len_2 <- length(dplyr::select(example_dataset, dplyr::contains("CTRL"))) # Verifico quanti casi sono presenti per il secondo gruppo
+group <- as.factor(c(rep(1, len_1), rep(2, len_2)))
+design <- model.matrix(~0 + group)
+contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+fit <- lmFit(example_dataset, design)
+fit2 <- contrasts.fit(fit, contrasts.matrix)
+fit2 <- eBayes(fit2)
+limma_table <- topTable(fit2, sort.by = "p", number = 148)
+head(example_dataset) # Sommario delle prime features analizzate
+limma_table # Risultati dell'analisi LIMMA
+hist(limma_table$P.Value, col=10, main = "Histogram of p-Value - STZ vs CTRL", xlab= "p-Value")
+hist(limma_table$adj.P.Val, col=10, main = "Histogram of adjusted p-Value - STZ vs CTRL", xlab= "adj. p-Value")
+volcanoplot(fit2)
+
+pca_dataset <- t(example_dataset)
+colnames(pca_dataset) <- rownames(example_dataset)
+pca_results <- pca(pca_dataset, ncomp = 6)
+plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+```
+
+### Analisi di Enrichment su miRNA differenzialmente espressi con p-Value < 0.05 nell'ippocampo tra STZ e INS
+```{r paged.print=TRUE, cache=TRUE}
+# Selezione dei miRNA di interesse
+dataset_enrich <- read.csv2("Report_dataset_ippocampo_STZ_VS_INS_.txt", row.names = 1)
+dataset_enrich_sel1 <- dataset_enrich %>% dplyr::filter(P.value < 0.05)
+miRNAs_selected <- row.names(dataset_enrich_sel1)
+
+# Elimino i dati non validi (non riconosciuti da miEAA)
+miRNAs_selected <- gsub(".", "-", miRNAs_selected, fixed = TRUE)
+miRNAs_to_remove <- c("rno-miR-3084c-3p", "rno-miR-3084c-5p", "rno-miR-3591")
+miRNAs_filtered <- setdiff(miRNAs_selected, miRNAs_to_remove)
+
+# Analisi GSEA effettuata attraverso miEAA (https://ccb-compute2.cs.uni-saarland.de/mieaa2)
+mieaa_all <- rba_mieaa_enrich(test_set = miRNAs_filtered, mirna_type = "mature", test_type = "GSEA", species = "Rattus Norvegicus", categories = c("miRWalk_GO_mature", "miRWalk_Diseases_mature"))
+```
+
+```{r fig.width=10, paged.print=TRUE}
+# Costruzione heatmap
+enrich_GO <- mieaa_all %>% dplyr::filter(X1 == "Gene Ontology (miRWalk)") %>% arrange(X5)
+if (nrow(enrich_GO) > 20)
+{
+  enrich_GO <- enrich_GO[1:20,]
+}
+enrich_disease <- mieaa_all %>% dplyr::filter(X1 == "Diseases (miRWalk)") %>% arrange(X5)
+
+# Heatmap per disease enrichment
+mirna_names_d <- c()
+for (i in 1:nrow(enrich_disease))
+{
+  temp_vector_d <- strsplit(enrich_disease[i,"X8"],"; ")
+  for (j in 1:length(temp_vector_d[[1]]))
+  {
+    mirna_names_d <- c(mirna_names_d, temp_vector_d[[1]][[j]])
+  }
+}
+mirna_names_unique_d <- unique(mirna_names_d) # Creo una lista dei miRNA presenti nei risultati dell'Enrichment
+heatmap_dataframe_d <- data.frame(matrix(ncol = length(mirna_names_unique_d), nrow = nrow(enrich_disease)))
+colnames(heatmap_dataframe_d) <- mirna_names_unique_d
+rownames(heatmap_dataframe_d) <- enrich_disease[, "X2"]
+for (i in 1:nrow(heatmap_dataframe_d))
+{
+  for (j in 1:ncol(heatmap_dataframe_d))
+  {
+    if (grepl(colnames(heatmap_dataframe_d)[j], enrich_disease[i,"X8"]) == TRUE)
+    {
+      heatmap_dataframe_d[i,j] <- enrich_disease[i, "X5"] # Riporto il p-Value all'interno della heatmap
+    }
+    else
+    {
+      heatmap_dataframe_d[i,j] <- NA 
+    }
+  }
+}
+
+heatmap_dataframe_numeric_d <- as.matrix(heatmap_dataframe_d)
+Heatmap(heatmap_dataframe_numeric_d, na_col = "white", name = "p-Values corretti", rect_gp = gpar(col = "white", lwd = 2))
+```
+
+```{r fig.width=10, paged.print=TRUE}
+# Heatmap per GO annotations enrichment
+mirna_names_g <- c()
+for (i in 1:nrow(enrich_GO))
+{
+  temp_vector_g <- strsplit(enrich_GO[i,"X8"],"; ")
+  for (j in 1:length(temp_vector_g[[1]]))
+  {
+    mirna_names_g <- c(mirna_names_g, temp_vector_g[[1]][[j]])
+  }
+}
+mirna_names_unique_g <- unique(mirna_names_g) # Creo una lista dei miRNA presenti nei risultati dell'Enrichment
+heatmap_dataframe_g <- data.frame(matrix(ncol = length(mirna_names_unique_g), nrow = nrow(enrich_GO)))
+colnames(heatmap_dataframe_g) <- mirna_names_unique_g
+rownames(heatmap_dataframe_g) <- enrich_GO[, "X2"]
+
+for (i in 1:nrow(heatmap_dataframe_g))
+{
+  for (j in 1:ncol(heatmap_dataframe_g))
+  {
+    if (grepl(colnames(heatmap_dataframe_g)[j], enrich_GO[i,"X8"]) == TRUE)
+    {
+      heatmap_dataframe_g[i,j] <- enrich_GO[i, "X5"] # Riporto il p-Value all'interno della heatmap
+    }
+    else
+    {
+      heatmap_dataframe_g[i,j] <- NA 
+    }
+  }
+}
+
+heatmap_dataframe_numeric_g <- as.matrix(heatmap_dataframe_g)
+Heatmap(heatmap_dataframe_numeric_g, na_col = "white", name = "p-Values corretti", rect_gp = gpar(col = "white", lwd = 2))
+```
+
+## Omica 3: Metabolomica
+Il metaboloma rappresenta l'insieme di tutti i metaboliti di un organismo, che sono i prodotti finali della sua espressione genica. Per metabolomica si intende lo studio delle scie di metaboliti lasciati da specifici processi cellulari, come fossero delle 
+
+### Caricamento dataset e Pre-processing
+```{r fig.width=10, paged.print=TRUE}
+dataset <- read.csv2("Metabolomica/Met.csv", row.names = 1)  # Caricamento dataset
+dataset = dplyr::select(dataset, !{"Additional.Info"}) # Rimozione delle informazioni meno importanti
+dataset <- dataset[, grep("< LOD", dataset, invert = TRUE)]
+data_splitted <- split(dataset, dataset$Material) # group_split non può essere utilizzato in quanto non mantiene i nomi dei casi (righe)
+```
+
+Divisione del dataset
+```{r fig.width=10, paged.print=TRUE}
+tbl_cerebellum <- dplyr::select(data_splitted[["Cerebellum"]], !{"Material"})
+tbl_cerebCrtx <- dplyr::select(data_splitted[["Cerebral cortex"]], !{"Material"})
+tbl_heart <- dplyr::select(data_splitted[["Heart"]], !{"Material"})
+tbl_hypotalamus <- dplyr::select(data_splitted[["Hypotalamus"]], !{"Material"})
+tbl_hyppocampus <- dplyr::select(data_splitted[["Hyppocampus"]], !{"Material"})
+tbl_kidney <- dplyr::select(data_splitted[["Kidney"]], !{"Material"})
+tbl_liver <- dplyr::select(data_splitted[["Liver"]], !{"Material"})
+tbl_plasma <- dplyr::select(data_splitted[["Plasma"]], !{"Material"})
+```
+
+Trasformazione in scala logaritmica dei dati e normalizzazione tramite z-score
+```{r paged.print=TRUE}
+dataset_list <- c("tbl_cerebellum", "tbl_cerebCrtx", "tbl_heart", "tbl_hypotalamus", "tbl_hyppocampus", "tbl_kidney", "tbl_liver", "tbl_plasma")
+norm_dataset_list <- c("n_tbl_cerebellum", "n_tbl_cerebCrtx", "n_tbl_heart", "n_tbl_hypotalamus", "n_tbl_hyppocampus", "n_tbl_kidney", "n_tbl_liver", "n_tbl_plasma")
+for (j in 1 : length(dataset_list))
+{
+  dataset_to_normalize <- eval(parse(text = dataset_list[j]))
+  assign(norm_dataset_list[j], t(scale(t(log(dataset_to_normalize))))) # La funzione scale effettua l'operazione per colonne, quindi si trspone la matrice per normalizzare per samples
+}
+```
+
+### Visualizzazione di alcuni dati pre- e post-normalizzazione
+```{r fig.width=10, paged.print=TRUE}
+data_vis <- data.frame(tbl_cerebellum[,1])
+data_vis_l <- log(data.frame(tbl_cerebellum[,1]))
+data_vis_n <- data.frame(n_tbl_cerebellum[, 1]) 
+
+bp1 <- ggplot(data.frame(data_vis[,1]), aes(x="Carnitine", y=data_vis[,1])) + 
+  geom_boxplot()
+bp2 <- ggplot(data.frame(data_vis_l[,1]), aes(x="log-Carnitine", y=data_vis_l[,1])) + 
+  geom_boxplot()
+bp3 <- ggplot(data.frame(data_vis_n[,1]), aes(x="norm-Carnitine", y=data_vis_n[,1])) + 
+  geom_boxplot()
+grid.arrange(bp1, bp2, bp3, nrow = 1)
+```
+
+### Analisi con Limma
+In questo caso si vuole capire la significatività statistica tra le differenti quantità di metaboliti presenti tra i gruppi confrontati
+```{r eval=FALSE, paged.print=TRUE}
+# Analisi effettuata per ogni distretto campionato
+ctrl_check <- "CTRL"
+stz_check  <- "STZ"
+ins_check  <- "INS"
+for (j in norm_dataset_list){
+  dataset_to_analyze <- as.data.frame(t(eval(parse(text = j))))
+  # Confronti tra INS e CTRL, CTRL e STZ, STZ e INS
+  for (i in 1 : 3)
+  {
+    if (i == 1)
+    {
+      check_1 <- ctrl_check
+      check_2 <- ins_check
+    }
+    else if (i == 2)
+    {
+      check_1 <- stz_check
+      check_2 <- ctrl_check
+    }
+    else if (i == 3)
+    {
+      check_1 <- stz_check
+      check_2 <- ins_check
+    }
+    temp_dataset <- dataset_to_analyze %>% dplyr::select(contains(check_1) | contains(check_2))
+    group <- as.factor(c(rep(1, 4), rep(2, 4)))
+    design <- model.matrix(~0 + group)
+    contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+    fit <- lmFit(temp_dataset, design)
+    fit2 <- contrasts.fit(fit, contrasts.matrix)
+    fit2 <- eBayes(fit2)
+    limma_table = topTable(fit2)
+    hist(limma_table$P.Value, col=10, main = "Histogram of p-Value", xlab= "p-Value")
+    hist(limma_table$adj.P.Val, col=10, main = "Histogram of adjusted p-Value", xlab= "adj. p-Value")
+    
+    head(temp_dataset)
+    
+    volcanoplot(fit2)
+    
+    # PCA esplorativa
+    pca_dataset <- t(temp_dataset)
+    colnames(pca_dataset) <- rownames(temp_dataset)
+    pca_results <- pca(pca_dataset, ncomp = 6)
+    pca_results
+    # Plot della distribuzione della varianza dopo PCA
+    plot(pca_results)
+    # Plot che mostra quali metaboliti pesano maggiormente sulla varianza della componente 1
+    plotLoadings(pca_results, title = 'Pesi sulla componente 1')
+    # Plot della distribuzione spaziale, tra le due componenti principali rilevate dalla PCA, dei casi presi in esame
+    plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+    
+    # Salvataggio dati
+    jpeg(paste("MET_volcanoplot_", j, check_1, check_2, ".jpeg", sep = "_"), width = 700, height = 500)
+    volcanoplot(fit2)
+    dev.off()
+    
+    write.fit(fit2, file = paste("MET_Report", j, check_1, "VS", check_2, ".txt", sep = "_"), sep = ";", adjust = "BH")
+  
+    jpeg(paste("MET_pcaIndiv", j, check_1, check_2, ".jpeg", sep = "_"), width = 700, height = 500)
+    plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+    dev.off()
+  }
+}
+```
+
+### Esempio: Risultati dell'analisi tra gruppo STZ e INS nell'ippocampo
+```{r fig.width=10, paged.print=TRUE}
+example_dataset <- as.data.frame(t(n_tbl_kidney)) %>% dplyr::select(contains("STZ") | contains("INS"))
+group <- as.factor(c(rep(1, 4), rep(2, 4)))
+design <- model.matrix(~0 + group)
+contrasts.matrix <- makeContrasts(group2-group1, levels=colnames(design)) 
+fit <- lmFit(example_dataset, design)
+fit2 <- contrasts.fit(fit, contrasts.matrix)
+fit2 <- eBayes(fit2)
+limma_table = topTable(fit2, number = 150)
+hist(limma_table$P.Value, col=10, main = "Histogram of p-Value - STZ vs INS", xlab= "p-Value")
+hist(limma_table$adj.P.Val, col=10, main = "Histogram of adjusted p-Value - STZ vs INS", xlab= "adj. p-Value")
+volcanoplot(fit2)
+head(example_dataset)
+
+pca_dataset <- t(example_dataset)
+colnames(pca_dataset) <- rownames(example_dataset)
+pca_results <- pca(pca_dataset, ncomp = 6)
+plotLoadings(pca_results, title = 'Pesi sulla componente 1')
+plot(pca_results)
+plotIndiv(pca_results, group = group, title = 'Individui sulle componenti 1 - 2')
+```
+### Enrichment Analysis
+
+Preparazione  del database
+```{r fig.width=10, paged.print=TRUE, cache=TRUE}
+set.seed(1)
+graph <- buildGraphFromKEGGREST(
+  organism = "rno",
+  filter.path = c("01100", "01200", "01210", "01212", "01230"))
+
+tmpdir <- paste0(getwd(), "/my_database")
+unlink(tmpdir, recursive = TRUE)
+buildDataFromGraph(
+  keggdata.graph = graph,
+  databaseDir = tmpdir,
+  internalDir = FALSE,
+  matrices = "none",
+  normality =  "diffusion",
+  niter = 100)
+
+alias2entrez <- as.list(org.Rn.eg.db::org.Rn.egSYMBOL2EG)
+entrez2ec <- KEGGREST::keggLink("enzyme", "rno")
+entrez2path <- KEGGREST::keggLink("pathway", "rno")
+fella.data <- loadKEGGdata(
+  databaseDir = tmpdir,
+  internalDir = FALSE,
+  loadMatrix = "none"
+)
+#fella.data
+id.cpd <- getCom(fella.data, level = 5, format = "id") %>% names
+id.rx <- getCom(fella.data, level = 4, format = "id") %>% names
+id.ec <- getCom(fella.data, level = 3, format = "id") %>% names
+
+# Informazioni sul database 
+cat(getInfo(fella.data))
+```
+```{r fig.width=10, paged.print=TRUE}
+# In questa fase si decide di quali dati fare l'enrichment, in particolare in questo caso vengono selezionati solo i metaboliti che hanno avuto un p-Value corretto < 0.1 con LIMMA nel confronto STZ vs INS (ippocampo)
+best_metabolites <- read.csv("MET_Report_n_tbl_hyppocampus_STZ_VS_INS_.txt", row.names = 1, sep = ";")
+best_metabolites = best_metabolites %>% arrange(P.value) %>% filter(P.value < 0.05)
+head(best_metabolites)
+```
+In questa fase i metaboliti che sono risultati idonei alla soglia impostata vengono salvati su un file txt
+```{r fig.width=10, paged.print=TRUE}
+# Salvataggio in txt
+fileConn<-file("Nomi_metaboliti_da_convertire.txt")
+writeLines(row.names(best_metabolites), fileConn)
+close(fileConn)
+```
+
+Conversione dei nomi dei metaboliti da analizzare per lettura tramite codice KEGG. Questo procedimento viene effettuato esternamente tramite: https://www.metaboanalyst.ca/MetaboAnalyst/upload/ConvertView.xhtml
+
+Una volta convertiti, i KEGG ID vengono caricati
+```{r fig.width=10, paged.print=TRUE}
+dataset_enrich <- read.csv("Metabolomica/metaboliti_KEGG_name.csv", row.names = 1)
+dataset_enrich_f <- dataset_enrich %>% filter(!is.na(dataset_enrich$KEGG)) %>% dplyr::select(KEGG) 
+
+enrich_vector <- unlist(dataset_enrich_f) 
+
+compounds <- defineCompounds(compounds = enrich_vector, data = fella.data)
+getInput(compounds)
+getExcluded(compounds)
+
+# L'operazione di enrichment viene fatto tramite un metodo diffusion-based
+enrich_results <- enrich(compounds = enrich_vector, data = fella.data, methods = "diffusion")
+results_table <- generateResultsTable(object = enrich_results, data = fella.data, method = "diffusion")
+
+ 
+vertex.label.cex <- 1
+png('MET_enrich_results.png', width = 700, height = 700)
+plot(enrich_results, method = "diffusion", data = fella.data, nlimit = 50, vertex.label.cex = vertex.label.cex, plotLegend = TRUE)
+dev.off()
+
+```
